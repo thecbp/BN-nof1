@@ -1,0 +1,383 @@
+---
+title: "Full Analysis Pipeline"
+author: "Christian Pascual"
+date: "11/1/2021"
+output: pdf_document
+---
+
+# Preparation For Building Networks
+
+```{r}
+# Vector to stop future from arcing into past
+past = c("p_steps", "p_diff", "p_gaz")
+inputs = c("steps", "diff")
+prev_inputs = c("p_steps", "p_diff")
+ema_preds = c("busypred", "stresspred", "typicalpred")
+ema_actual = c("hecticactual", "stressactual", "typicalactual")
+
+# Blacklist for preventing certain arcs from  being created in networks
+bl = matrix(c(
+  
+  # The future shouldn't affect the past
+  c(rbind("steps", past)),
+  c(rbind("diff", past)),
+  c(rbind("gaz", past)),
+  
+  "p_steps", "p_diff",
+  "p_gaz", "p_diff",
+  
+  # Preventing post-steps from arcing into pre-steps
+  c(rbind("gaz", inputs)),
+  c(rbind("p_gaz", prev_inputs)),
+  
+  # goal difficulty should not affected by anything
+  c(rbind(inputs, "diff")),
+  c(rbind(prev_inputs, "diff")),
+  c(rbind(ema_preds, "diff")),
+  c(rbind(ema_actual, "diff")),
+  
+  # Predictions should not come after the days events
+  c(rbind("hecticactual", ema_preds)),
+  c(rbind("stressactual", ema_preds)),
+  c(rbind("typicalactual", ema_preds)),
+  c(rbind("steps", ema_preds)),
+  c(rbind("diff", ema_preds)),
+  c(rbind("gaz", ema_preds)),
+  c(rbind("hecticactual", past)),
+  c(rbind("stressactual", past)),
+  c(rbind("typicalactual", past)),
+  c(rbind("steps", "sleep")),
+  c(rbind("diff", "sleep")),
+  c(rbind("gaz", "sleep")),
+  c(rbind("busypred", past)),
+  c(rbind("stresspred", past)),
+  c(rbind("typicalpred", past))
+  
+),
+ncol = 2, byrow = TRUE, 
+dimnames = list(NULL, c("from", "to")))
+```
+
+# Load In Raw Just Walk Data
+
+```{r, message = F }
+raw_just_walk = here::here("data", "Data_JustWalk.csv") %>% 
+  read_csv() %>% 
+  select(participant:self_e_tminus1) %>% 
+  mutate(
+    participant = as.character(participant),
+  ) %>% 
+  group_by(participant) %>% 
+  mutate(
+    prev_goal_difficulty = lag(goal_difficulty, 1),
+    prev_actual_steps = lag(actual_steps, 1)
+  ) %>% 
+  ungroup %>% 
+  filter(!is.na(goal_difficulty_tminus1))
+  
+# Prepare the data for use in the networks
+just_walk = raw_just_walk %>% 
+  select(
+    participant,
+    day,
+    steps = actual_steps,
+    diff = goal_difficulty,
+    gaz = g_achiev_z, 
+    p_steps = prev_actual_steps,
+    p_diff = prev_goal_difficulty,
+    p_gaz = g_achiev_z_tminus1
+  )
+  
+# Load in the imputed data and match
+imputed_ema = read_csv("../data/imputed_ema.csv") %>% 
+  mutate( participant = as.character(participant) )
+  
+full_just_walk = just_walk %>% 
+  left_join(imputed_ema, by = c("participant", "day")) %>% 
+  drop_na()
+```
+
+# Create Networks Using First N Days Of Data
+
+```{r}
+R = 1000 # number bootstrap networks too average from
+limited_individual_networks = full_just_walk %>% 
+  group_by(participant) %>% 
+  summarize( 
+    start = min(day),
+    last = max(day) 
+  ) %>% 
+  mutate(
+    n_days = map2(start, last, function(s, t) { tibble(n_days = (s + 1):t) })
+  ) %>% 
+  unnest_wider(n_days) %>% 
+  unnest(n_days) %>% 
+  select(-start, -last) %>% 
+  mutate(
+    # Filter the data down to a limited set of days
+    lim_data = map2(participant, n_days, function(p, n) {
+      full_just_walk %>% 
+        filter(participant == p, day <= n) %>% 
+        select(-participant, -day)
+    }),
+    # Create the network based off the limited data
+    lim_network = pmap(list(participant, lim_data, n_days), function(p, d, n) {
+      
+      # Progress bar for sanity:
+      print(paste0("ID: ", p, ", Network for ", n, " days"))
+      
+      arcs = boot.strength(d, 
+                           algorithm = "hc",
+                           algorithm.args = list("blacklist" = bl),
+                           R = R)
+      
+      mean_arcs = mean(arcs)
+      averaged.network(mean_arcs)
+      
+    })
+  ) 
+
+limited_aggregate_networks = tibble(
+    participant = "Aggregated",
+    n_days = 17:93, # range of days in the data
+    lim_data = map(n_days, function(n) {
+      
+      full_just_walk %>% 
+        filter(day <= n) %>% 
+        select(-participant, -day)
+      
+    }),
+    lim_network = map(lim_data, function(d) {
+      
+      arcs = boot.strength(d, 
+                           algorithm = "hc",
+                           algorithm.args = list("blacklist" = bl),
+                           R = R)
+      
+      mean_arcs = mean(arcs)
+      averaged.network(mean_arcs)
+      
+    })
+  )
+
+limited_networks = bind_rows(limited_individual_networks,
+                             limited_aggregate_networks)
+save(limited_networks, file = "data/limited_networks_final.rda")
+```
+
+```{r}
+# check: what do the networks look like
+NetworkDisplayApp()
+```
+
+Note To Self:
+
+- some arcs were created in the averaged network that would produce cycles
+   - these were presumed to be ignored + not included in the plot
+
+# Calculate Change in BIC For Each Arc In Each Network
+
+- averaged.network() sometimes returns undirected edges, so some processing is needed to remove all of them in a principled way
+
+```{r}
+bic_analysis = limited_networks %>% 
+  mutate(
+    final_lim_network = map2(lim_network, lim_data, function(ntwk, d) {
+      
+      # Remove all undirected arcs (happens with small data)
+      undirected = undirected.arcs(ntwk)
+      if (nrow(undirected) > 0) {
+        # Undirected arcs come in pairs, so opt to remove even indices
+        for (i in seq(1, nrow(undirected)/2, by = 1)) {
+          
+          ntwk = drop.arc(ntwk, from = undirected[i,1], to = undirected[i,2])
+        }
+      }
+      
+      ntwk
+      
+    }),
+    bic_change = map2(final_lim_network, lim_data, function(ntwk, d) { 
+      
+      arcstrength = arc.strength(ntwk, d) 
+      
+      full_bic = score(ntwk, d)
+      arcs = arcs(ntwk)
+      n_arcs = arcs(ntwk) %>% nrow()
+      
+      # If no arcs there should be no table
+      if (n_arcs == 0) { 
+        return(data.frame(from = character(),
+                          to = character(),
+                          strength = double(),
+                          full_bic = double(), 
+                          drop_bic = double(), 
+                          change_bic = double()))
+      }
+      
+      bics = double(n_arcs)
+      change_bics = double(n_arcs)
+      
+      for (i in 1:n_arcs) {
+        
+        # Remove an arc from the averaged network
+        small_ntwk = drop.arc(ntwk, from = arcs[i,][1], to = arcs[i,][2])
+        
+        # Calculate new BIC of the smaller network when arc is removed
+        # The lower the better
+        bics[i] = score(small_ntwk, d) 
+        change_bics[i] = full_bic - score(small_ntwk, d)
+        
+      }
+      
+      cbind(arcstrength,
+            full_bic = full_bic, 
+            drop_bic = bics, 
+            change_bic = change_bics)
+
+      })
+  ) 
+
+bic_data = bic_analysis %>% 
+  select(participant, n_days, bic_change) %>% 
+  unnest_wider(bic_change) %>% 
+  unnest(c("from", "to", "strength", "full_bic", "drop_bic", "change_bic")) %>% 
+  mutate(
+    arcstr = map2_chr(from, to, function(f, t) {
+      paste0(f, "->", t)
+    })
+  )
+
+save(bic_data, file = "data/bic_data_final.rda")
+```
+
+Note To Self:
+
+- The unnesting removes all of the networks that have no arcs in them (ie early arcs)
+
+# Calculate The True And False Positives With Time
+
+```{r}
+last_days = bic_analysis %>% 
+  group_by(participant) %>% 
+  summarize( max_days = max(n_days) )
+
+full_networks = bic_analysis %>% 
+  left_join(last_days, by = "participant") %>% 
+  filter(n_days == max_days) %>% 
+  select(participant, full_network = final_lim_network)
+
+development_data = bic_analysis %>% 
+  left_join(full_networks, by = "participant") %>% 
+  select(participant, n_days, final_lim_network, full_network) %>% 
+  mutate(
+    comp =  map2(final_lim_network, full_network, function(lim, fin) {
+      compare(target = fin, current = lim)
+    }),
+    comparcs =  map2(final_lim_network, full_network, function(lim, fin) {
+      compare(target = fin, current = lim, arcs = T)
+    }),
+    n_arcs_full = map_dbl(full_network, function(ntwk) {nrow(arcs(ntwk))}),
+    true_positive = map_dbl(comp, function(cc) { cc$tp }),
+    false_positive = map_dbl(comp, function(cc) { cc$fp }),
+    false_negative = map_dbl(comp, function(cc) { cc$fn }),
+    true_positive_arcs = map(comparcs, function(cc) { as_tibble(cc$tp) }),
+    false_positive_arcs = map(comparcs, function(cc) { as_tibble(cc$fp) }),
+    false_negative_arcs = map(comparcs, function(cc) { as_tibble(cc$fn) }),
+    prop_tp = true_positive / n_arcs_full
+  )
+
+save(development_data, file = "data/network_development_final.rda")
+```
+
+# Match Up BIC Changes To TP, FP, and FN
+
+```{r}
+check = development_data %>% 
+  select(participant, n_days, false_positive_arcs) %>% 
+  unnest_wider(false_positive_arcs) %>% unnest(c("from", "to")) %>% 
+  mutate(
+    arcstr = map2_chr(from, to, function(f, t) {
+      paste0(f, "->", t)
+    })
+  ) %>% 
+  left_join(bic_data %>% select(participant, n_days, arcstr, change_bic),
+            by = c("participant", "n_days", "arcstr"))
+
+c("true_positive_arcs", "false_positive_arcs", "false_negative_arcs")
+```
+
+# Create HeatMap Data
+
+```{r}
+# heat map for checking the presence of absence of an arc on a given day
+# get all arcs that were ever made for all networks
+all_arcstrings = bic_data %>% pull(arcstr) %>% unique
+ids = bic_data %>% pull(participant) %>% unique
+days = bic_data %>% pull(n_days) %>% unique
+
+# All possible participant, arc and day number combinations
+p = expand.grid(ids, all_arcstrings, days) %>% 
+  as_tibble()
+colnames(p) = c("participant", "arcstr", "n_days")
+p = p %>% mutate(arcstr = unlist(arcstr))
+
+# Tibble of
+present = bic_data %>% 
+  select(participant, n_days, arcstr, change_bic) %>% 
+  mutate( 
+    arcstr = unlist(arcstr)
+  )
+
+id_max_day = bic_data %>% 
+  group_by(participant) %>% 
+  summarize( last = max(n_days) )
+
+heat = p %>% 
+  left_join(present, by = c("participant", "n_days", "arcstr")) %>% 
+  left_join(id_max_day, by = "participant") %>% 
+  filter(n_days <= last) %>% 
+  mutate(
+    present = if_else(is.na(change_bic), 0, 1)
+  )
+
+save(heat, file = "data/heatmap_data_final.rda")
+```
+
+# checking how long it takes to learn a network
+
+```{r}
+# Time to learn a full network
+a = development_data %>% 
+  transmute(
+    time = n_days,
+    prop_present = true_positive / n_arcs_full,
+    above_50 = (prop_present >= 0.50) %>% as.numeric,
+    above_75 = (prop_present >= 0.75) %>% as.numeric,
+    above_90 = (prop_present >= 0.90) %>% as.numeric
+  ) %>% 
+  group_by(time) %>% 
+  summarize(
+    `50% learned` = mean(above_50),
+    `75% learned` = mean(above_75),
+    `90% learned` = mean(above_90)
+  ) %>% 
+  pivot_longer(
+    `50% learned`:`90% learned`,
+    names_to = "prop",
+    values_to = "val"
+  )
+
+a %>% 
+  ggplot(aes(x = time, y = val, color = prop)) +
+  geom_line() + 
+  labs(
+    x = "Days used to learn network",
+    y = "Proportion of sample who have learned\n a portion of full network"
+  )
+```
+
+```{r}
+
+```
+

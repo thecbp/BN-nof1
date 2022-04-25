@@ -1,0 +1,773 @@
+---
+title: "Simulation Study"
+author: "Christian Pascual"
+output: pdf_document
+---
+
+```{r, message = F, warning = F }
+library(tidyverse)
+library(bnlearn)
+```
+
+# Specific Aims
+
+1. Can a Bayesian network reliably reconstruct the underlying structure that generated the dataset?
+2. What are the conditions where the network can be reliably constructed?
+
+# Data Generation
+
+![](manuscript/img/bn-manuscript-fig-1.png)
+
+We denote 4 networks A, B, C and D with a particular network feature of interest. In each network, there are three predictors $X_1, X_2, X_3$ and an outcome $Y$. The predictors are all Gaussian random variables. Locally, any child node is also a linear regression of its parents.
+
+- A (regression): all predictors $X_1, X_2, X_3$ are parents to the outcome $Y$
+- B (confounder): $X_1$ is a confounder on the relationship between $X_2$ and $Y$. $X_3$ is independent of $Y$.
+- C (mediator): $X_2$ is a mediator in the relationship between $X_1$ and $Y$. $X_3$ is independent of $Y$.
+- D (v-structure): $X_1$ is a parent to both $X_2$ and $Y$. $X_3$ is independent of $Y$.
+
+
+# Summary of Simulation Results
+
+1. Structures **A**, **C** and **D** are reliably recovered after about 30 observations. **A** and **D** can be recovered with about 20 observations.
+2. Whether a Bayesian network can recover the correct confounding structure actually depends on the nature of the confounding. The Bayesian network is generally successful at recovering the correct structure when:
+  - the effect of the predictor $X_2$ on outcome $Y$ is positive, and the effects of the confounder $X_1$ on the predictor and outcome have the opposite signs
+  - the effect of the predictor $X_2$ on outcome $Y$ is negative, and the effects of the confounder $X_1$ on the predictor and outcome have the same signs
+3. When the Bayesian network doesn't completely capture the confounding relationship, these are the most common errors if we are in the conditions above:
+  - Both of $X_1$'s arcs are found, but the direction from $X_2$ to $Y$ is reversed. That is, $Y$ is incorrectly believed to be the parent of $X_2$
+  - The confounding error is believed to be a mediator relationship. The link betwen $X_1$ and $Y$ is missed.
+4. If we do not have the confounding relationships described in 2, these are the most common mistakes:
+  - $X_2$ is believed to be the confounder instead, and $Y$ is a parent to $X_1$
+  - A mediator relationship is learned instead. One of the predictors is a parent to the outcome $Y$, and the outcome is a parent to the other predictor
+5. Finally, assuming that we have a confounding strucutre we can recover, it takes about 30 observations to recover it
+
+
+# Conclusions
+
+The procedure used in our paper can recover the basic substructures that might appear in a Bayesian network with a reasonable amount of data (~30 observations, about a month of daily checks). Confounding structures should be treated with care, and observed relationships from learned networks should be viewed as exploratory. Our findings increase our confidence that it is possible to learn important probablistic structures in a dataset.
+
+
+The actual code for the simulations has been kept after this page.
+
+\pagebreak
+
+# Simulations
+
+## 1. Sample Size Needed To Recover Network
+
+I want to see here how much data is needed for the network to be reconstructed purely from just trying out the Hill Climbing Algorithm with no bootstrap.
+
+- All predictors will have mean `1` and variance `1`.
+- For a child node, the coefficient associated with each predictor will also be `1`.
+
+```{r, echo =  F}
+set.seed(1)
+sim1 = tibble(
+  n_ = seq(10, 100, by = 10),
+  ntwkA = map(n_, function(n) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = 1 * X1 + 1 * X2 + 1 * X3, sd = 1)
+      )
+    
+    ntwk = hc(data)
+    
+    }),
+  ntwkB = map(n_, function(n) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1 * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = 1 * X1 + 1 * X2, sd = 1)
+    )
+    
+    ntwk = hc(data)
+    
+  }),
+  ntwkC = map(n_, function(n) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1 * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, 1 * X2, sd = 1)
+    )
+    
+    ntwk = hc(data)
+    
+  }),
+  ntwkD = map(n_, function(n) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1 * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = 1 * X1, sd = 1)
+    )
+    
+    ntwk = hc(data)
+    
+  })
+  ) %>% 
+  pivot_longer(
+    ntwkA:ntwkD,
+    names_to = "structure",
+    values_to = "network"
+  ) %>% 
+  mutate(
+    comp = map2(structure, network, function(s, n) {
+      
+      if (s == "ntwkA") {
+        
+        e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "Y", 
+                         "X2", "Y", 
+                         "X3", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+        
+      } else if (s == "ntwkB") {
+        
+        e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+        
+      } else if (s == "ntwkC") {
+        
+        e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+        
+      } else if (s == "ntwkD") {
+        
+        e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+        
+      }
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r, echo = F }
+sim1 %>% 
+  mutate(
+    structure = case_when(
+      structure == "ntwkA" ~ "A",
+      structure == "ntwkB" ~ "B",
+      structure == "ntwkC" ~ "C",
+      structure == "ntwkD" ~ "D"
+    ),
+    metric = case_when(
+      metric == "tp" ~ "True Positive",
+      metric == "fp" ~ "False Positive",
+      metric == "fn" ~ "False Negative"
+    )
+  ) %>% 
+  ggplot(aes(x = n_, y = count, color = metric)) +
+  geom_line() + 
+  facet_grid(rows = vars(structure)) +
+  theme_minimal() +
+  labs(
+    x = "Sample size",
+    y = "Arc Count"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+## Observations
+
+- After 20 observations, the network fully learned network A (regression)
+- For network B (confounder), the relationship between $X_2$ and $Y$ is correctly established. $X_3$ is correctly identified to be independent. However, its gets the direction wrong between the confounder $X_1$ and $Y$. (see below)
+  - Strangely, the correct network is recovered at $n = 60$ but is lost afterwards.
+- After 30 observations, the network fully learned network C (mediator)
+- After 20 observations, the network fully learned network D (v-structure)
+
+```{r, echo = F }
+Bn100 = sim1 %>% 
+  filter(structure == "ntwkB", n_ == 100) %>% 
+  pull(network) %>% .[[1]]
+graphviz.plot(Bn100,
+              main = "Network B, n = 100")
+```
+
+## 2. Dealing With Confounding
+
+Simulation 1 tells us that the Hill Climbing approach struggles to recover the relationships between the confounder $X_1$ with both $X_2$ and $Y$. 
+
+In this section, I test if there is anything I can change to recover confounder relationship.
+
+Parameters:
+
+- Sample size: 70
+- Keep the same parameters from the B structure used in Simulation 1, but vary the effect of $X_1$ on $X_2$
+
+### 2.1 Does changing the effect of $X_1$ on $X_2$ better recover this relationship?
+
+```{r, echo = F }
+set.seed(1)
+n = 70
+sim2 = tibble(
+  beta = seq(1, 10, by = 1),
+  network = map(beta, function(b) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = b * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = 1 * X1 + 1 * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r, echo = F }
+sim2 %>% 
+  ggplot(aes(x = beta, y = count, color = metric)) +
+  geom_line() + 
+  
+  labs(
+    title = "Simulation 2: Effect of X1 to X2 on recovery (no bootstrap)",
+    x = "Beta X1 to X2",
+    y = "Arc Count"
+  )
+```
+
+```{r, echo = F }
+betas = sim2 %>% pull(beta) %>% unique
+for (b in betas) {
+  Bn100 = sim2 %>% 
+  filter(beta == b) %>% 
+  pull(network) %>% .[[1]]
+graphviz.plot(Bn100,
+              main = paste0("Network B, beta = ", b))
+  
+}
+
+```
+
+### Observations
+
+- At lower levels of the coefficient between $X_1$ and $X_2$ (2-5), the network recovers the correct structure. 
+- At higher levels, the network correctly learns 2 of the relationships in the confounder triangle, but misses the link between $X_1$ and $Y$
+
+### 2.2 Does changing the effect of $X_1$ on $Y$ better recover this relationship?
+
+- Same experiment as 2.1, but this changes the effect of $X_1$ on the outcome instead of with the other predictor
+
+```{r, echo =  F }
+set.seed(1)
+n = 70
+sim3 = tibble(
+  beta = seq(1, 10, by = 1),
+  network = map(beta, function(b) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1 * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = b * X1 + 1 * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r, echo = F }
+sim3 %>% 
+  ggplot(aes(x = beta, y = count, color = metric)) +
+  geom_line() + 
+  
+  labs(
+    title = "Simulation 3: Effect of X1 to Y on recovery (no bootstrap)",
+    x = "Beta X1 to Y",
+    y = "Arc Count"
+  )
+```
+
+```{r, echo = F }
+betas = sim3 %>% pull(beta) %>% unique
+for (b in betas) {
+  Bn100 = sim3 %>% 
+  filter(beta == b) %>% 
+  pull(network) %>% .[[1]]
+graphviz.plot(Bn100,
+              main = paste0("Network B, beta = ", b))
+  
+}
+```
+
+### Observations
+
+- Just by changing the relationship between $X$ and $Y$, it recovers the confounder relationship but the wrong one. It thinks that the outcome $Y$ is a parent to $X_2$
+- $X_3$ is typically correctly indentified as independent of everything else
+
+### 2.3 Does changing the effect of $X_1$ on both $X_2$ and $Y$ better recover this relationship?
+
+- Same experiment as 2.1 and 2.2, but this changes the effect of $X_1$ on both variables
+
+```{r, echo = F }
+set.seed(1)
+n = 70
+sim4 = tibble(
+  beta = seq(1, 10, by = 1),
+  network = map(beta, function(b) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = b * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = b * X1 + 1 * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r, echo = F }
+sim4 %>% 
+  ggplot(aes(x = beta, y = count, color = metric)) +
+  geom_line() + 
+  labs(
+    title = "Simulation 4: Effect of X1 to X2 and Y (no bootstrap)",
+    x = "Beta X1 to X2 and Y",
+    y = "Arc Count"
+  )
+```
+
+```{r, echo = F }
+betas = sim4 %>% pull(beta) %>% unique
+for (b in betas) {
+  Bn100 = sim4 %>% 
+  filter(beta == b) %>% 
+  pull(network) %>% .[[1]]
+graphviz.plot(Bn100,
+              main = paste0("Network B, beta = ", b))
+  
+}
+
+```
+
+### Observations
+
+- Increasing both at the same time does a worse job. Does not recover the confounding relationship at all
+
+### 2.4 Does changing the effect of $X_2$ and $Y$ better recover this relationship?
+
+- Same experiment as 2.1, 2.2 and 2.3, but this changes the effect of $X_2$ on $Y$
+
+```{r, echo = F }
+set.seed(1)
+n = 70
+sim5 = tibble(
+  beta = seq(1, 10, by = 1),
+  network = map(beta, function(b) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 1, sd = 1),
+      X2 = rnorm(n, mean = 1 * X1, sd = 1),
+      X3 = rnorm(n, mean = 1, sd = 1),
+      Y = rnorm(n, mean = 1 * X1 + b * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r, echo = F }
+sim5 %>% 
+  ggplot(aes(x = beta, y = count, color = metric)) +
+  geom_line() + 
+  labs(
+    title = "Simulation 5: Effect of X2 on Y (no bootstrap)",
+    x = "Beta X2 on Y",
+    y = "Arc Count"
+  )
+```
+
+```{r, echo = F }
+betas = sim5 %>% pull(beta) %>% unique
+for (b in betas) {
+  Bn100 = sim5 %>% 
+  filter(beta == b) %>% 
+  pull(network) %>% .[[1]]
+graphviz.plot(Bn100,
+              main = paste0("Network B, beta = ", b))
+  
+}
+
+```
+
+### Observations
+
+- Recovers the confounder relationship, but the directions are incorrect. Both $X_2$ and $Y$ point to $X_1$ instead
+
+### 2.5 What if we just check out all of the different combinations of effects in the confounder triangle?
+
+```{r}
+set.seed(1)
+n = 70
+
+sim6 = expand.grid(-5:5, -5:5, -5:5) %>% 
+  filter(Var1 != 0, Var2 != 0, Var3 != 0) %>% 
+  select(beta1 = Var1, beta2 = Var2, beta3 = Var3) %>% 
+  mutate(
+    network = pmap(list(beta1, beta2, beta3), function(b1, b2, b3) {
+    
+    data = tibble(
+      X1 = rnorm(n, mean = 0, sd = 1),
+      X2 = rnorm(n, mean = (b1) * X1, sd = 1),
+      X3 = rnorm(n, mean = 0, sd = 1),
+      Y = rnorm(n, mean = (b2) * X1 + (b3) * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  )
+```
+
+```{r}
+sim6_viz = sim6 %>% 
+  mutate(
+    combo = case_when(
+      beta1 > 0 & beta2 > 0 &beta3 > 0 ~ "+, +, +",
+      beta1 < 0 & beta2 > 0 &beta3 > 0 ~ "-, +, +",
+      beta1 > 0 & beta2 < 0 &beta3 > 0 ~ "+, -, +",
+      beta1 < 0 & beta2 < 0 &beta3 > 0 ~ "-, -, +",
+      beta1 > 0 & beta2 > 0 &beta3 < 0 ~ "+, +, -",
+      beta1 < 0 & beta2 > 0 &beta3 < 0 ~ "-, +, -",
+      beta1 > 0 & beta2 < 0 &beta3 < 0 ~ "+, -, -",
+      beta1 < 0 & beta2 < 0 &beta3 < 0 ~ "-, -, -"
+    )
+  ) 
+# %>% 
+#   pivot_longer(
+#     tp:fn,
+#     names_to = "arc_class",
+#     values_to = "count"
+#   )
+
+conftbl = sim6_viz %>% 
+  group_by(combo) %>% 
+  summarize(
+    n = n(),
+    avg_tp = mean(tp),
+    avg_fp = mean(fp),
+    avg_fn = mean(fn),
+    se_tp = sd(tp),
+    se_fp = sd(fp),
+    se_fn = sd(fn)
+  ) %>% 
+  transmute(
+    combo = combo,
+    n = n,
+    tp = paste0(avg_tp %>% round(2), " (", se_tp %>% round(2), ")"),
+    fp = paste0(avg_fp %>% round(2), " (", se_fp %>% round(2), ")"),
+    fn = paste0(avg_fn %>% round(2), " (", se_fn %>% round(2), ")")
+  )
+
+write.csv(conftbl, file = "ntwkB_results.csv")
+```
+
+
+```{r}
+library(plotly)
+library(RColorBrewer)
+sim61 = sim6 %>% 
+  filter(tp > 1) %>% 
+  mutate( tp = factor(tp ,levels = c(3, 2))) 
+p = plot_ly(sim61, x = ~beta1, y = ~beta2, z = ~beta3, type = "scatter3d", mode = "markers",
+            colors = "Dark2", color = ~tp, size = 1)
+
+p
+```
+
+### Observations
+
+- There are very distinct regimes of coefficients where the Bayesian network is able to detect the correct confounding structure. These regimes are as follows:
+  - $\beta > 0$ for $X_2$ to $Y$: The correct structure is generally recovered when the signs for the effect of $X_1$ on $X_2$ and the effect of $X_1$ on $Y$ have opposite signs.
+  - $\beta < 0$ for $X_2$ to $Y$: The correct structure is generally recovered when the signs for the effect of $X_1$ on $X_2$ and the effect of $X_1$ on $Y$ have the same signs.
+- Sometimes the correct structure can be recovered in the opposite circumstances, but these are when one of the confounding arms is small.
+- As the size of the effect increases, the confounding structure is more likely to be found (the full 3 arms of the triangle found, as opposed to just 2)
+
+### 2.5.1 What happens in the networks where only 2 of the true arcs were discovered?
+
+```{r, eval = F }
+tp2ntwks = sim6 %>% filter(tp == 2) %>% 
+  group_by(network) %>%
+  summarize( count = n()) %>% 
+  arrange(-count)
+
+for (i in 1:nrow(tp2ntwks)) {
+  
+  nn = tp2ntwks$network[[i]]
+  count = tp2ntwks$count[i]
+  graphviz.plot(nn, main = paste0("count = ", count))
+  
+}
+```
+
+Most common mistakes:
+  - flip the relationship between the outcome $Y$ and the predictor $X_2$
+  - miss the relationship between $X_1$ and $Y$ (mistaken $X_2$ as mediator)
+  
+### 2.5.2 What happens in the networks where only 1 of the true arcs were discovered?
+
+```{r, eval = F }
+tp1ntwks = sim6 %>% filter(tp == 1) %>% 
+  group_by(network) %>%
+  summarize( count = n()) %>% 
+  arrange(-count)
+
+for (i in 1:nrow(tp1ntwks)) {
+  
+  nn = tp1ntwks$network[[i]]
+  count = tp1ntwks$count[i]
+  graphviz.plot(nn, main = paste0("count = ", count))
+  
+}
+```
+
+Most common mistakes:
+  - $X_2$ believed to be confounder, relationship between $Y$ and $X_1$ flipped
+  - same as above, but the link between $X_2$ and $X_1$ missed ($Y$ is mediator of $X_2$ on $X_1$)
+    - less frequently, $Y$ is mediator of $X_1$ on $X_2$
+  - less frequently, a v-structure on either $X_2$ or $X_1$ is learned
+  
+### 2.6 Given a confounding structure that can be reliably retrieved, how much data do we need to recover it?
+
+```{r}
+set.seed(1)
+
+sim7 = tibble(
+  n = seq(10, 100, by = 10)
+) %>% 
+  mutate(
+    beta3 = map(n, function(n_) { c(5, 5, -5, -5) }),
+    beta1 = map(n, function(n_) { c(5, -5, 5, -5) }),
+    beta2 = map(n, function(n_) { c(-5, 5, 5, -5) }),
+    case = map(n, function(n_) { c("B1", "B2", "B3", "B4") })
+    ) %>% 
+  unnest(c("beta3", "beta1", "beta2", "case")) %>% 
+  mutate(
+    network = pmap(list(n, beta1, beta2, beta3), function(nn, b1, b2, b3) {
+    
+    data = tibble(
+      X1 = rnorm(nn, mean = 0, sd = 1),
+      X2 = rnorm(nn, mean = (b1) * X1, sd = 1),
+      X3 = rnorm(nn, mean = 0, sd = 1),
+      Y = rnorm(nn, mean = (b2) * X1 + (b3) * X2, sd = 1)
+    )
+    
+    hc(data)
+    
+    })
+  ) %>% 
+  mutate(
+    comp = map(network, function(n) {
+      
+      e = empty.graph(c("X1", "X2", "X3", "Y"))
+        edges = matrix(c("X1", "X2", 
+                         "X1", "Y", 
+                         "X2", "Y"),
+                       ncol = 2, byrow = TRUE,
+                       dimnames = list(NULL, c("from", "to")))
+        
+        arcs(e) = edges
+        c = compare(e, n)
+        
+        c
+      
+    }),
+    tp = map_dbl(comp, function(c) { c$tp }),
+    fp = map_dbl(comp, function(c) { c$fp }),
+    fn = map_dbl(comp, function(c) { c$fn })
+  ) %>% 
+  pivot_longer(
+    tp:fn,
+    names_to = "metric",
+    values_to = "count"
+  )
+```
+
+```{r}
+sim7 %>% 
+  filter(case == "B4") %>% 
+  ggplot(aes(x = n, y = count, color = metric)) +
+  geom_line() + 
+  labs(
+    title = "Simulation 7: Sample size needed to recover structure B",
+    x = "Sample Size",
+    y = "Arc Count"
+  )
+```
+
